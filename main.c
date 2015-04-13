@@ -20,7 +20,14 @@ void handleRequest(void* request);
 #define BYTES_PER_MB (1000000)
 #define WEBSERVER_PORT "http"
 #define GET_REQUEST_FIELD "GET"
-#define HOST_FIELD "Host: "
+#define FIELD_HOST "Host: "
+#define FIELD_USER_AGENT "User-Agent: "
+#define FIELD_ACCEPT "Accept: "
+#define FIELD_ACCEPT_LANGUAGE "Accept-Language: "
+#define FIELD_ACCEPT_ENCODING "Accept-Encoding: "
+#define FIELD_CONNECTION "Connection: "
+#define SPACE " /"
+#define NEW_LINE "\n"
 
 typedef struct cache_element {
 	struct cache_element* next;
@@ -153,19 +160,105 @@ char receivedContent[MAX_CONTENT_LEN];
 pthread_mutex_t mutexsum;
 
 
-//take raw request and fix fields 
+//take raw request and fix fields
 /*
-get this to look like format char* from main2.c 
-strstr on user-agent 
+get this to look like format char* from main2.c
+strstr on user-agent
 
 
 
 */
-char* formatOutgoingRequest(char* request) {
+char* formatOutgoingRequest(char* request, char* urlSuffix) {
 //RYAN
-	char* outgoingRequest = (char*) malloc(strlen(request)+5);
-	memcpy(outgoingRequest, request, strlen(request));
-	memcpy(outgoingRequest + strlen(request), "\r\n\r\n\0", 5);
+	char* outgoingRequest = (char*) malloc(strlen(request)+15); //TODO: change back to 5?
+	int size = 0;
+	memcpy(outgoingRequest, GET_REQUEST_FIELD, strlen(GET_REQUEST_FIELD));
+	size += strlen(GET_REQUEST_FIELD);
+	memcpy(outgoingRequest + size , SPACE, strlen(SPACE));
+	size+= strlen(SPACE);
+	memcpy(outgoingRequest + size , urlSuffix, strlen(urlSuffix));
+	size += strlen(urlSuffix);
+	//return to new line
+	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
+	size+= strlen(NEW_LINE);
+
+	//HOST
+	memcpy(outgoingRequest + size, FIELD_HOST, strlen(FIELD_HOST));
+	size+= strlen(FIELD_HOST);
+	char* temp_host = "dartmouth.edu";
+	memcpy(outgoingRequest + size, temp_host, strlen(temp_host));
+	size+= strlen(temp_host);
+	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
+	size+= strlen(NEW_LINE);
+
+	//User-Agent
+	memcpy(outgoingRequest + size, FIELD_USER_AGENT, strlen(FIELD_USER_AGENT));
+	size+= strlen(FIELD_USER_AGENT);
+	char* temp_userAgent = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:23.0) Gecko/20100101 Firefox/23.0";
+	//char* temp_userAgent = "runscope/0.1";
+	memcpy(outgoingRequest + size, temp_userAgent, strlen(temp_userAgent));
+	size+= strlen(temp_userAgent);
+	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
+	size+= strlen(NEW_LINE);
+
+
+
+
+	//Accept
+	memcpy(outgoingRequest + size, FIELD_ACCEPT, strlen(FIELD_ACCEPT));
+	size+= strlen(FIELD_ACCEPT);
+	char* temp_accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+	//char* temp_accept = "*/*";
+	memcpy(outgoingRequest + size, temp_accept, strlen(temp_accept));
+	size+= strlen(temp_accept);
+	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
+	size+= strlen(NEW_LINE);
+
+	//Accept-Language
+	memcpy(outgoingRequest + size, FIELD_ACCEPT_LANGUAGE, strlen(FIELD_ACCEPT_LANGUAGE));
+	size+= strlen(FIELD_ACCEPT_LANGUAGE);
+	char* temp_accept_language = "en-US,en;q=0.5";
+	memcpy(outgoingRequest + size, temp_accept_language, strlen(temp_accept_language));
+	size+= strlen(temp_accept_language);
+	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
+	size+= strlen(NEW_LINE);
+
+
+
+
+
+	//Accept-Encoding
+	memcpy(outgoingRequest + size, FIELD_ACCEPT_ENCODING, strlen(FIELD_ACCEPT_ENCODING));
+	size+= strlen(FIELD_ACCEPT_ENCODING);
+	char* temp_accept_encoding = "gzip, deflate";
+	memcpy(outgoingRequest + size, temp_accept_encoding, strlen(temp_accept_encoding));
+	size+= strlen(temp_accept_encoding);
+
+	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
+	size+= strlen(NEW_LINE);
+
+
+
+
+
+	//Connection
+	memcpy(outgoingRequest + size, FIELD_CONNECTION, strlen(FIELD_CONNECTION));
+	size+= strlen(FIELD_CONNECTION);
+	char* temp_connection = "keep-alive";
+	memcpy(outgoingRequest + size, temp_connection, strlen(temp_connection));
+	size+= strlen(temp_connection);
+
+	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
+	size+= strlen(NEW_LINE);
+
+	memcpy(outgoingRequest + size, "\r\n\r\n\0", 5);
+
+
+	//memcpy(outgoingRequest + strlen(GET_REQUEST_FIELD) + strlen(urlSuffix) , temp, strlen(temp));
+
+
+	//memcpy(outgoingRequest, request, strlen(request));
+	//memcpy(outgoingRequest + strlen(GET_REQUEST_FIELD) + strlen(urlSuffix) + strlen(temp), "\r\n\r\n\0", 5);
 	return outgoingRequest;
 //	char* oldUserAgent = strstr(request, "User-Agent:");
 //	char* fieldsAfterAgent = strstr(oldUserAgent,"\n") + 1;
@@ -192,7 +285,7 @@ char* formatOutgoingRequest(char* request) {
 
 
 char* makeRequest(char* request) {
-
+	printf("**************************Initial Input Request:****************** \n %s ----------END OF REQUST----------\n", request);
 	int outgoing_sock = -1;
 	struct addrinfo hints, *servinfo, *p;
 
@@ -204,7 +297,12 @@ char* makeRequest(char* request) {
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 
-	char* hostName = parseFieldFromRequest(request, HOST_FIELD);
+	char* hostName = parseFieldFromRequest(request, FIELD_HOST);
+	char* urlSuffix = parseFieldFromRequest(request, hostName);
+	//printf("host name = %s -----\n", hostName);
+	//printf("SUFFIX name = %s -----\n", urlSuffix);
+
+
 	getaddrinfo(hostName, WEBSERVER_PORT, &hints, &servinfo);
 	free(hostName);
 
@@ -224,17 +322,16 @@ char* makeRequest(char* request) {
 		break;
 	}
 
-	//char* outgoingRequest = formatOutgoingRequest(request);
-	char* outgoingRequest = request;
-	printf("Outgoing request: \n%s\n", outgoingRequest);
+	char* outgoingRequest = formatOutgoingRequest(request, urlSuffix);
+	//char* outgoingRequest = request;
+	printf("********NEW OUTGOING REQUEST********: \n%s\n*************", outgoingRequest);
 //	char* outgoingRequest = request;
-
 
 	if (send(outgoing_sock, outgoingRequest, strlen(outgoingRequest), 0) < 0) {
 		perror("Send error:");
 		printf("Failed Request: \n%s\n", outgoingRequest);
 		close(outgoing_sock);
-		free(outgoingRequest); //error could be trying to "request" twice 
+		free(outgoingRequest); //error could be trying to "request" twice
 		return NULL;
 	}
 
