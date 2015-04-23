@@ -7,56 +7,65 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <errno.h>
 #include <netdb.h>
 
-int start_proxy_server(uint16_t port, uint16_t cache_size);
-void sig_handler(int sig);
-void handleRequest(void* request);
+////////////////////// Constants and Struct Declarations ///////////////////////////////
 
-#define MAX_MSG_LENGTH (512)
-#define MAX_REQUEST_LEN (500)
-#define MAX_BACK_LOG (5)
-#define MAX_CONTENT_LEN (1000000)
+#define MAX_REQUEST_LEN (5000)
+#define MAX_CONCURRENT_REQ (200)
+#define MAX_BACK_LOG (30)
+#define MAX_CONCURRENT_CONNECTIONS (5)
+#define MAX_CONTENT_LEN (2000000)
+#define REC_BUFFER_SIZE (4096)
 #define BYTES_PER_MB (1000000)
 #define WEBSERVER_PORT "http"
 #define GET_REQUEST_FIELD "GET"
-#define FIELD_HOST "Host: "
-#define FIELD_USER_AGENT "User-Agent: "
-#define FIELD_ACCEPT "Accept: "
-#define FIELD_ACCEPT_LANGUAGE "Accept-Language: "
-#define FIELD_ACCEPT_ENCODING "Accept-Encoding: "
-#define FIELD_CONNECTION "Connection: "
-#define SPACE " /"
-#define NEW_LINE "\n"
+#define HOST_FIELD "Host: "
 
 typedef struct cache_element {
 	struct cache_element* next;
 	struct cache_element* prev;
-	uint32_t bytes;
-	char* content;
+	int numResponseBytes;
+	char* response;
 	char* request;
 } cache_element;
 
 typedef struct cache {
-	cache_element* MR;	//Most recent add
-	cache_element* LR; //Least recent add
-	uint32_t bytes;
-	uint32_t max_bytes;
+	cache_element* MR;
+	cache_element* LR;
+	int bytes;
+	int max_bytes;
 } cache;
 
-int sock, server_accepted_sock;
+
+/////////////////////////// Global State ///////////////////////////////////
+
+
 cache* LRU_cache;
+int browserProxySock;
+int numActiveThreads;
+pthread_mutex_t count_mutex;
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
 
-/**
- * Scans the cache starting at the most recently added element
- * for a cache element with the input request. If such an element
- * exists, a pointer to it is returned. Otherwise, return NULL
- */
+/////////////////////////// Cache Functions ///////////////////////////////////
+
+
+
+void initializeCache(int port, int cache_size) {
+	LRU_cache = (cache*) malloc(sizeof(cache));
+	LRU_cache->max_bytes = cache_size * BYTES_PER_MB;
+	LRU_cache->LR = LRU_cache->MR = NULL;
+	LRU_cache->bytes = 0;
+}
+
 cache_element* scanCacheForElement(char* request) {
-	cache_element* temp = LRU_cache->MR;
-	while(temp != NULL) {
-		if(strcmp(request, temp->request) == 0) {
+	cache_element* temp;
+	temp = LRU_cache->MR;
+	while (temp != NULL) {
+		if (strcmp(request, temp->request) == 0) {
 			return temp;
 		}
 		temp = temp->next;
@@ -64,418 +73,382 @@ cache_element* scanCacheForElement(char* request) {
 	return NULL;
 }
 
-/**
- * Removes input cache element from cache and updates the
- * bytes field of the cache.
- */
+
 void removeElementFromCache(cache_element* el) {
-	cache_element* prevEl = el->prev;
-	cache_element* nextEl = el->next;
-	if(prevEl) {
-		prevEl->next = nextEl;
+	if (el->prev) {
+		(el->prev)->next = el->next;
 	}
-	if(nextEl) {
-		nextEl->prev = prevEl;
+	if (el->next) {
+		(el->next)->prev = el->prev;
 	}
-	LRU_cache->bytes -= el->bytes;
+	LRU_cache->bytes -= el->numResponseBytes;
+
+	if (el == LRU_cache->MR) {
+		LRU_cache->MR = el->next;
+	}
+	if (el == LRU_cache->LR) {
+		LRU_cache->LR = el->prev;
+	}
+}
+
+void removeAndFreeLRElementFromCache() {
+	cache_element* el = LRU_cache->LR;
+	removeElementFromCache(el);
 	free(el->request);
-	free(el->content);
+	free(el->response);
 	free(el);
 }
 
-/**
- * Adds most recently accessed element to the front of the cache Linked list.
- */
 void addElementToCache(cache_element* MRelement) {
-
-	if(MRelement->bytes > LRU_cache->max_bytes) {
+	if (MRelement->numResponseBytes > LRU_cache->max_bytes) {
 		return;
 	}
 
-	while(LRU_cache->bytes + MRelement->bytes > LRU_cache->max_bytes) {
-		removeElementFromCache(LRU_cache->LR);
+	while (LRU_cache->bytes + MRelement->numResponseBytes > LRU_cache->max_bytes) {
+		removeAndFreeLRElementFromCache();
 	}
 
-	//Update Cache with MRU
 	MRelement->prev = NULL;
-	MRelement->next = LRU_cache->MR;
-	LRU_cache->MR = MRelement;
-	if(LRU_cache->LR == NULL) {
-		LRU_cache->LR = MRelement;
+
+	if (LRU_cache->LR == NULL) {
+		LRU_cache->LR = LRU_cache->MR = MRelement;
+	} else {
+		MRelement->next = LRU_cache->MR;
+		(LRU_cache->MR)->prev = MRelement;
+		LRU_cache->MR = MRelement;
 	}
+	LRU_cache->bytes += MRelement->numResponseBytes;
 }
 
-
-
-/**
- * Given an element in the cache that was recently fetched, the element
- * is made to be the most recently accessed element in the cache.
- */
 void updateCacheMR(cache_element* MRelement) {
 	removeElementFromCache(MRelement);
 	addElementToCache(MRelement);
 }
 
 
+cache_element* buildCacheElement(char* parsedRequest, int response_bytes,
+		char* response) {
+	cache_element* el;
+	el = (cache_element*) malloc(sizeof(cache_element));
+	memset(el, 0, sizeof(cache_element));
 
+	el->request = (char*) malloc(strlen(parsedRequest) + 1);
+	memcpy(el->request, parsedRequest, strlen(parsedRequest) + 1);
 
+	el->response = (char*) malloc(response_bytes);
+	memcpy(el->response, response, response_bytes);
 
-int main(int argc, char ** argv)
-{
-	if (argc != 3) {
-		printf("Command should be: myprog <port> <cache size in MB>\n");
-		return 1;
-	}
-	uint16_t port = atoi(argv[1]);
-	if (port < 1024 || port > 65535) {
-		printf("Port number should be equal to or larger than 1024 and smaller than 65535\n");
-		return 1;
-	}
-	uint16_t cache_size = atoi(argv[2]);
-	if(cache_size < 1 || cache_size > 100) {
-		printf("Cache size must be between 1 MB and 100 MB");
-		return 1;
-	}
-	start_proxy_server(port, cache_size);
-	return 0;
+	el->numResponseBytes = response_bytes;
+	el->next = NULL;
+	el->prev = NULL;
+	return el;
 }
 
-/**
- * Given the title of a field in the request body such as Host: , this function
- * returns the field.
- */
+/////////////////////////// Helper Functions ///////////////////////////////////
+
+
+int timeoutOccurred() {
+	return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
+
+int isPostRequest(char* request) {
+	return strstr(request, "GET") != request;
+}
+
 char* parseFieldFromRequest(char* request, char* field) {
 	int offset = (field == GET_REQUEST_FIELD) ? 0 : strlen(field);
 	char* requestStart = strstr(request, field) + offset;
 	char* requestEnd = strstr(requestStart, "\r");
-	int parsedRequestLen = requestEnd-requestStart;
-	char* parsedRequest = (char*) malloc(parsedRequestLen);
-	memset(parsedRequest, 0, parsedRequestLen);
+	int parsedRequestLen = requestEnd - requestStart;
+	char* parsedRequest = (char*) malloc(parsedRequestLen + 1);
 	memcpy(parsedRequest, requestStart, parsedRequestLen);
+	parsedRequest[parsedRequestLen] = '\0';
 	return parsedRequest;
 }
 
-char receivedContent[MAX_CONTENT_LEN];
+void sig_handler(int sig) {
+	if (browserProxySock) {
+		close(browserProxySock);
+		printf("Socket was closed.\n");
+	}
+	exit(0);
+}
 
-pthread_mutex_t mutexsum;
-
-
-//take raw request and fix fields
-/*
-get this to look like format char* from main2.c
-strstr on user-agent
-
-
-
-*/
-char* formatOutgoingRequest(char* request, char* urlSuffix) {
-//RYAN
-	char* outgoingRequest = (char*) malloc(strlen(request)+15); //TODO: change back to 5?
-	int size = 0;
-	memcpy(outgoingRequest, GET_REQUEST_FIELD, strlen(GET_REQUEST_FIELD));
-	size += strlen(GET_REQUEST_FIELD);
-	memcpy(outgoingRequest + size , SPACE, strlen(SPACE));
-	size+= strlen(SPACE);
-	memcpy(outgoingRequest + size , urlSuffix, strlen(urlSuffix));
-	size += strlen(urlSuffix);
-	//return to new line
-	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
-	size+= strlen(NEW_LINE);
-
-	//HOST
-	memcpy(outgoingRequest + size, FIELD_HOST, strlen(FIELD_HOST));
-	size+= strlen(FIELD_HOST);
-	char* temp_host = "dartmouth.edu";
-	memcpy(outgoingRequest + size, temp_host, strlen(temp_host));
-	size+= strlen(temp_host);
-	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
-	size+= strlen(NEW_LINE);
-
-	//User-Agent
-	memcpy(outgoingRequest + size, FIELD_USER_AGENT, strlen(FIELD_USER_AGENT));
-	size+= strlen(FIELD_USER_AGENT);
-	char* temp_userAgent = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:23.0) Gecko/20100101 Firefox/23.0";
-	//char* temp_userAgent = "runscope/0.1";
-	memcpy(outgoingRequest + size, temp_userAgent, strlen(temp_userAgent));
-	size+= strlen(temp_userAgent);
-	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
-	size+= strlen(NEW_LINE);
-
-
-
-
-	//Accept
-	memcpy(outgoingRequest + size, FIELD_ACCEPT, strlen(FIELD_ACCEPT));
-	size+= strlen(FIELD_ACCEPT);
-	char* temp_accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
-	//char* temp_accept = "*/*";
-	memcpy(outgoingRequest + size, temp_accept, strlen(temp_accept));
-	size+= strlen(temp_accept);
-	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
-	size+= strlen(NEW_LINE);
-
-	//Accept-Language
-	memcpy(outgoingRequest + size, FIELD_ACCEPT_LANGUAGE, strlen(FIELD_ACCEPT_LANGUAGE));
-	size+= strlen(FIELD_ACCEPT_LANGUAGE);
-	char* temp_accept_language = "en-US,en;q=0.5";
-	memcpy(outgoingRequest + size, temp_accept_language, strlen(temp_accept_language));
-	size+= strlen(temp_accept_language);
-	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
-	size+= strlen(NEW_LINE);
-
-
-
-
-
-	//Accept-Encoding
-	memcpy(outgoingRequest + size, FIELD_ACCEPT_ENCODING, strlen(FIELD_ACCEPT_ENCODING));
-	size+= strlen(FIELD_ACCEPT_ENCODING);
-	char* temp_accept_encoding = "gzip, deflate";
-	memcpy(outgoingRequest + size, temp_accept_encoding, strlen(temp_accept_encoding));
-	size+= strlen(temp_accept_encoding);
-
-	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
-	size+= strlen(NEW_LINE);
-
-
-
-
-
-	//Connection
-	memcpy(outgoingRequest + size, FIELD_CONNECTION, strlen(FIELD_CONNECTION));
-	size+= strlen(FIELD_CONNECTION);
-	char* temp_connection = "keep-alive";
-	memcpy(outgoingRequest + size, temp_connection, strlen(temp_connection));
-	size+= strlen(temp_connection);
-
-	memcpy(outgoingRequest + size, NEW_LINE, strlen(NEW_LINE));
-	size+= strlen(NEW_LINE);
-
-	memcpy(outgoingRequest + size, "\r\n\r\n\0", 5);
-
-
-	//memcpy(outgoingRequest + strlen(GET_REQUEST_FIELD) + strlen(urlSuffix) , temp, strlen(temp));
-
-
-	//memcpy(outgoingRequest, request, strlen(request));
-	//memcpy(outgoingRequest + strlen(GET_REQUEST_FIELD) + strlen(urlSuffix) + strlen(temp), "\r\n\r\n\0", 5);
-	return outgoingRequest;
-//	char* oldUserAgent = strstr(request, "User-Agent:");
-//	char* fieldsAfterAgent = strstr(oldUserAgent,"\n") + 1;
-//	char* newUserAgent = "User-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:23.0) Gecko/20100101 Firefox/23.0\r\n\r\n";
-
-//	int beforeAgentLen = oldUserAgent - request;
-//
-//	int outgoingRequestLen = beforeAgentLen + strlen(newUserAgent);
-//	char* outgoingRequest = (char*) malloc(outgoingRequestLen);
-//
-//	memcpy(outgoingRequest, request, beforeAgentLen);
-//	memcpy(outgoingRequest + beforeAgentLen, newUserAgent, strlen(newUserAgent));
-//	return outgoingRequest;
-
-
-//	int outgoingRequestLen = strlen(request) - (fieldsAfterAgent-oldUserAgent) + strlen(newUserAgent);
-//	char* outgoingRequest = (char*) malloc(outgoingRequestLen);
-//
-//	memcpy(outgoingRequest, request, beforeAgentLen);
-//	memcpy(outgoingRequest + beforeAgentLen, newUserAgent, strlen(newUserAgent));
-//	memcpy(outgoingRequest + beforeAgentLen + strlen(newUserAgent), fieldsAfterAgent, outgoingRequestLen - beforeAgentLen - strlen(newUserAgent));
-//	return outgoingRequest;
+void sendContentToClient(int sock, cache_element* element) {
+	send(sock, element->response, (size_t) element->numResponseBytes, 0);
 }
 
 
-char* makeRequest(char* request) {
-	printf("**************************Initial Input Request:****************** \n %s ----------END OF REQUST----------\n", request);
-	int outgoing_sock = -1;
-	struct addrinfo hints, *servinfo, *p;
-
-	memset(&hints, 0, sizeof(hints));
-	memset(&servinfo, 0, sizeof(servinfo));
-	memset(&p, 0, sizeof(p));
-	memset(receivedContent, 0, MAX_CONTENT_LEN);
-
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-
-	char* hostName = parseFieldFromRequest(request, FIELD_HOST);
-	char* urlSuffix = parseFieldFromRequest(request, hostName);
-	//printf("host name = %s -----\n", hostName);
-	//printf("SUFFIX name = %s -----\n", urlSuffix);
+/////////////////////////// Proxy Functionality ///////////////////////////////////
 
 
-	getaddrinfo(hostName, WEBSERVER_PORT, &hints, &servinfo);
-	free(hostName);
+cache_element* readFromSocketAndBuildCacheElement(int outgoing_sock,
+		char* request, char* parsedRequest) {
 
-	for(p = servinfo; p != NULL; p = p->ai_next) {
-		if ((outgoing_sock = socket(p->ai_family, p->ai_socktype,
-				p->ai_protocol)) == -1) {
-			printf("In here swaggin\n");
-			//			perror("socket");
-		}
+	struct timeval timeout;
+	timeout.tv_sec = 1;
+	timeout.tv_usec = 0;
 
-		if (connect(outgoing_sock, p->ai_addr, p->ai_addrlen) == -1) {
-			close(outgoing_sock);
-			perror("connect");
-			continue;
-		}
-
-		break;
+	if (setsockopt(outgoing_sock, SOL_SOCKET, SO_RCVTIMEO, (char *) &timeout,
+			sizeof(timeout)) < 0) {
+		error("setsockopt failed\n");
 	}
 
-	char* outgoingRequest = formatOutgoingRequest(request, urlSuffix);
-	//char* outgoingRequest = request;
-	printf("********NEW OUTGOING REQUEST********: \n%s\n*************", outgoingRequest);
-//	char* outgoingRequest = request;
+	int totalBytesRead = 0;
+	int recv_len = 0;
 
-	if (send(outgoing_sock, outgoingRequest, strlen(outgoingRequest), 0) < 0) {
-		perror("Send error:");
-		printf("Failed Request: \n%s\n", outgoingRequest);
-		close(outgoing_sock);
-		free(outgoingRequest); //error could be trying to "request" twice
+	char* receivedContent;
+	receivedContent = (char*) malloc(MAX_CONTENT_LEN);
+	memset(receivedContent, 0, MAX_CONTENT_LEN);
+
+	while(1) {
+		recv_len = read(outgoing_sock, receivedContent + totalBytesRead,
+				MAX_CONTENT_LEN - totalBytesRead);
+
+		if (recv_len <= 0) {
+			if ((timeoutOccurred() || recv_len==0) && totalBytesRead > 0) {
+				break;
+			}
+			free(receivedContent);
+			return NULL;
+		}
+
+		totalBytesRead += recv_len;
+	}
+
+	cache_element* newElement = buildCacheElement(parsedRequest, totalBytesRead,
+			receivedContent);
+	free(receivedContent);
+	return newElement;
+}
+
+cache_element* makeRequestAndBuildCacheElement(char* request,
+		char* parsedRequest, int outgoing_sock) {
+
+	//connection is correct so now send request to web server
+	if (send(outgoing_sock, request, strlen(request), 0) < 0) {
+		perror("Send error");
+		printf("Failed Request: \n%s\n", request);
 		return NULL;
 	}
 
-	int recv_len = 0;
-	int totalBytesRead = 0;
+	return readFromSocketAndBuildCacheElement(outgoing_sock, request,
+			parsedRequest);
+}
 
-	do {
-		recv_len = read (outgoing_sock, receivedContent + totalBytesRead, MAX_CONTENT_LEN - totalBytesRead);
-		if (recv_len < 0) { // recv 0 bytes so you are done
-			perror("Recv error:");
-			close(outgoing_sock);
-			free(outgoingRequest);
-			return NULL;
+int handleRequest(int browser_sock, int server_sock, char* rawRequest_buf) {
+
+	char* parsedRequest = parseFieldFromRequest(rawRequest_buf,
+			GET_REQUEST_FIELD);
+
+	pthread_mutex_lock(&count_mutex);
+	cache_element* cache_element = scanCacheForElement(parsedRequest);
+	pthread_mutex_unlock(&count_mutex);
+
+	if (cache_element) {
+		printf("Cache HIT... Cache size: %d\n", LRU_cache->bytes);
+		pthread_mutex_lock(&count_mutex);
+		updateCacheMR(cache_element);
+		pthread_mutex_unlock(&count_mutex);
+	} else {
+		cache_element = makeRequestAndBuildCacheElement(rawRequest_buf,
+				parsedRequest, server_sock);
+		if (!cache_element) {
+			free(parsedRequest);
+			return -1;
 		}
-		totalBytesRead += recv_len;
-	} while(recv_len > 0 && totalBytesRead < MAX_CONTENT_LEN);
-
-	char *content = (char*) malloc(totalBytesRead);
-	memcpy(content, receivedContent, totalBytesRead);
-
-
-	free(outgoingRequest);
-	close(outgoing_sock);
-
-	return content;
-}
-
-
-void sendContentToClient(char* content) {
-	send(server_accepted_sock, content, strlen(content), 0);
-}
-
-void handleRequest(void* request) {
-
-	char* requestMsg = (char*) request;
-
-//	printf("Request:\n%s\n", requestMsg);
-
-	if(strlen(requestMsg) <= 0 || strstr(request, "GET") != request) {
-		printf("Request was not a GET\n");
-		return;
+		printf("Cache MISS... Cache size: %d\n", LRU_cache->bytes);
+		pthread_mutex_lock(&count_mutex);
+		addElementToCache(cache_element);
+		pthread_mutex_unlock(&count_mutex);
 	}
 
-	char* parsedRequest = parseFieldFromRequest(requestMsg, GET_REQUEST_FIELD);
+	sendContentToClient(browser_sock, cache_element);
+	free(parsedRequest);
+	return 0;
+}
 
-	cache_element* foundElement = scanCacheForElement(parsedRequest);
+void threadExit() {
+	pthread_mutex_lock(&mutex);
+	numActiveThreads--;
+	pthread_cond_signal(&cond);
+	pthread_mutex_unlock(&mutex);
+}
 
-	char* content;
+void handlePersistentConnection(void* browser_accepted_sock) {
 
-	if(foundElement == NULL) {
+	pthread_mutex_lock(&mutex);
+	while(numActiveThreads > MAX_CONCURRENT_CONNECTIONS) {
+		pthread_cond_wait(&cond, &mutex);
+	}
+	pthread_mutex_unlock(&mutex);
 
-		content = makeRequest(requestMsg);
+	char* rawRequest_buf;
+	int recv_len, server_sock, browser_sock;
+	int firstRequestReceived = 0;
 
-		if(content == NULL) {
-			printf("Failed to generate content\n");
+	browser_sock = (int) browser_accepted_sock;
+
+	struct timeval timeout;
+	timeout.tv_sec = 1;
+	timeout.tv_usec = 0;
+
+	if (setsockopt(browser_sock, SOL_SOCKET, SO_RCVTIMEO, (char *) &timeout,
+			sizeof(timeout)) < 0) {
+		error("setsockopt failed\n");
+	}
+
+	while (1) {
+
+		rawRequest_buf = (char*) malloc(MAX_REQUEST_LEN);
+		memset(rawRequest_buf, 0, MAX_REQUEST_LEN);
+
+		recv_len = recv(browser_sock, rawRequest_buf, MAX_REQUEST_LEN, 0);
+
+		if (recv_len <= 0 || timeoutOccurred() || isPostRequest(rawRequest_buf)) {
+			close(browser_sock);
+			free(rawRequest_buf);
 			return;
 		}
 
-		cache_element* newElement = (cache_element*) malloc(sizeof(cache_element));
-		memset(newElement, 0, sizeof(cache_element));
-		newElement->request = parsedRequest;
-		newElement->content = content;
-		newElement->bytes = strlen(content);
-		addElementToCache(newElement);
+		if (!firstRequestReceived) {
+			firstRequestReceived = 1;
+			struct addrinfo hints, *servinfo, *p;
 
+			server_sock = -1;
+
+			char * host;
+			host = parseFieldFromRequest(rawRequest_buf, HOST_FIELD);
+
+			memset(&hints, 0, sizeof(hints));
+
+			hints.ai_family = PF_UNSPEC;
+			hints.ai_socktype = SOCK_STREAM;
+			int s = getaddrinfo(host, WEBSERVER_PORT, &hints, &servinfo);
+
+			free(host);
+
+			if (s != 0) {
+				perror("getaddrinfo");
+				close(browser_sock);
+				free(rawRequest_buf);
+				threadExit();
+				return;
+			}
+
+			for (p = servinfo; p != NULL; p = p->ai_next) {
+				if ((server_sock = socket(p->ai_family, p->ai_socktype,
+						p->ai_protocol)) == -1) {
+					perror("socket creation");
+					continue;
+				}
+
+				if (connect(server_sock, p->ai_addr, p->ai_addrlen) == -1) {
+					close(server_sock);
+					perror("connect");
+					continue;
+				}
+
+				break;
+			}
+
+			if (server_sock == -1) {
+				close(server_sock);
+				close(browser_sock);
+				free(rawRequest_buf);
+				threadExit();
+				return;
+			}
+		}
+
+		if (handleRequest(browser_sock, server_sock, rawRequest_buf) < 0) {
+			close(server_sock);
+			close(browser_sock);
+			free(rawRequest_buf);
+			threadExit();
+			return;
+		}
+		free(rawRequest_buf);
 	}
-	else {
-		updateCacheMR(foundElement);
-		content = foundElement->content;
-	}
-	sendContentToClient(content);
-//	free(request);
 }
 
-void initializeCache(uint16_t port, uint16_t cache_size) {
-	LRU_cache = (cache*) malloc(sizeof(cache));
-	memset(LRU_cache, 0, sizeof(cache));
-	LRU_cache->max_bytes = cache_size*BYTES_PER_MB;
-}
+int start_proxy_server(int port, int cache_size) {
 
-
-int start_proxy_server(uint16_t port, uint16_t cache_size) {
-
-	int msg_len;
-	struct sockaddr_in server_addr, client_addr;
+	struct sockaddr_in client_addr;
 
 	int numThreads = 0;
-	pthread_t threads[20];
+	pthread_t threads[MAX_CONCURRENT_REQ];
 
-	signal(SIGINT, sig_handler);	//close socket on kill signal
-	signal(SIGPIPE,SIG_IGN);		//ignore SIG_PIPE signal
+	signal(SIGINT, sig_handler);
+	signal(SIGPIPE, SIG_IGN);
 
 	initializeCache(port, cache_size);
 
-	if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-		perror("Create socket error:");
-		return 1;
+	struct sockaddr_in server_addr;
+
+	if ((browserProxySock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+		perror("Create socket error");
+		return -1;
 	}
 
 	server_addr.sin_addr.s_addr = INADDR_ANY;
 	server_addr.sin_family = AF_INET;
 	server_addr.sin_port = htons(port);
 
-	if (bind(sock, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
+	if (bind(browserProxySock, (struct sockaddr *) &server_addr,
+			sizeof(server_addr)) < 0) {
 		perror("Binding socket error");
 		return 1;
 	}
-	printf("Binding Socket...\n");
 
-	listen(sock, MAX_BACK_LOG);
-	printf("Listening...\n");
+	listen(browserProxySock, MAX_BACK_LOG);
 
 	socklen_t client_addr_len = sizeof(client_addr);
 
-	//while(1) {
+	while (1) {
 
-		printf("Waiting for connection...\n");
+		int accepted_sock = accept(browserProxySock,
+				(struct sockaddr *) &client_addr, &client_addr_len);
 
-		server_accepted_sock = accept(sock, (struct sockaddr *) &client_addr, &client_addr_len);
-
-		if(server_accepted_sock < 0) {
+		if (accepted_sock < 0) {
 			perror("Accepting connection error");
 			return -1;
 		}
 
-		printf("Accepted connection...\n");
+		printf("Accepted browser persistent connection.\n");
 
-		char* rawRequest = (char*) malloc(500);
-		memset(rawRequest, 0, 500);
+		memset(&threads[numThreads], 0, sizeof threads[numThreads]);
 
-		msg_len = recv(server_accepted_sock, rawRequest, MAX_MSG_LENGTH, 0);
+		pthread_create(&threads[numThreads], NULL,
+				(void *) &handlePersistentConnection, (void *) accepted_sock);
 
-		//pthread_create(&threads[numThreads], NULL, (void *) &handleRequest, (void*) rawRequest);
-		//numThreads++;
-		handleRequest(rawRequest);
-	//}
+		numThreads = (numThreads < MAX_CONCURRENT_REQ) ? numThreads + 1 : 0;
+	}
+
 	return 0;
 }
 
 
-void sig_handler(int sig) {
-	if(server_accepted_sock) {
-		close(server_accepted_sock);
-		printf("Socket was closed.\n");
+////////////////////////////////// MAIN ///////////////////////////////////
+
+
+int main(int argc, char ** argv) {
+	if (argc != 3) {
+		printf("Command should be: myprog <port> <cache size in MB>\n");
+		return 1;
 	}
-	exit(0);
+	int port = atoi(argv[1]);
+	if (port < 1024 || port > 65535) {
+		printf(
+				"Port number should be equal to or larger than 1024 and smaller than 65535\n");
+		return 1;
+	}
+	int cache_size = atoi(argv[2]);
+	if (cache_size < 1 || cache_size > 100) {
+		printf("Cache size must be between 1 MB and 100 MB");
+		return 1;
+	}
+	start_proxy_server(port, cache_size);
+	return 0;
 }
